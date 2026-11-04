@@ -1,32 +1,30 @@
-# Renders one reel for the zenkio AI gateway. Started by the gateway with workflow_dispatch.
-# PUBLIC repo: logs and dispatch inputs are public. The input is only the unguessable reel id; the stills,
-# captions and music are fetched at run time with a repo secret and never printed or uploaded as artifacts.
-name: Render reel
-
+# Renders one reel for the zenkio AI Gateway. Started by the gateway with workflow_dispatch; the only input is the
+# reel id (inputs are visible on a public run page). The runner fetches its package from the gateway with the
+# RENDER_TOKEN secret and uploads reel.mp4 straight back: no artifacts, no commits, nothing stored in this repo.
+name: render
 on:
   workflow_dispatch:
     inputs:
       reel_id:
-        description: Reel id (from the gateway)
+        description: Reel id
         required: true
         type: string
-
 permissions:
   contents: read
-
 concurrency:
   group: render
   cancel-in-progress: false
-
 jobs:
   render:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Install ffmpeg and a font
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
       - name: Render and upload
+        run: python3 render.py
         env:
           GATEWAY_URL: ${{ vars.GATEWAY_URL }}
           RENDER_TOKEN: ${{ secrets.RENDER_TOKEN }}
           REEL_ID: ${{ inputs.reel_id }}
-        run: python3 render.py --reel "$REEL_ID"

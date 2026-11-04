@@ -1,159 +1,116 @@
 #!/usr/bin/env python3
-"""Render one reel from stills: pan and zoom per shot, captions, optional music, one MP4.
+"""Render one reel (zenkio AI Gateway, api-schema.md §21.4).
 
-Standard library only (the runner has ffmpeg). Nothing here is logged except the reel id, step names,
-sizes and timings: this repo is public, so run logs are public (see README.md).
-
-  python render.py --demo                      # synthetic stills, no network, writes out/demo.mp4
-  python render.py --reel <id>                 # fetch the package from the gateway, render, upload
-  python render.py --package package.json ...  # render a local package (stills as local paths)
-
-Package (draft interface, agreed in the gateway repo before it is built):
-  {"aspect": "9:16", "fps": 30, "music": "<url or path, optional>",
-   "shots": [{"still": "<url or path>", "seconds": 4, "caption": "text", "motion": "zoom_in|zoom_out|pan_left|pan_right"}]}
+Runs in a PUBLIC repo, so its logs are public: it prints only the reel id, step names, counts and sizes. Never
+captions, prompts or links. Captions go to ffmpeg through text files, never the command line. The token comes from
+the RENDER_TOKEN repo secret (masked), the gateway address from the GATEWAY_URL repo variable.
 """
-import argparse, json, os, shutil, subprocess, sys, tempfile, time, urllib.request
+import json, os, subprocess, sys, tempfile, textwrap, urllib.request
 
-SIZES = {"9:16": (1080, 1920), "1:1": (1080, 1080), "16:9": (1920, 1080), "4:5": (1080, 1350)}
-MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_left"]
-MAX_SHOTS, MAX_SECONDS, MAX_BYTES = 12, 8, 60 * 2**20
+GATEWAY = os.environ["GATEWAY_URL"].rstrip("/")
+TOKEN = os.environ["RENDER_TOKEN"]
+REEL = os.environ["REEL_ID"]
+FPS = 30
+SIZES = {"9:16": (1080, 1920), "1:1": (1080, 1080), "16:9": (1920, 1080)}
+FONT = next((f for f in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf") if os.path.exists(f)), None)
 
 
 def log(msg):
-    print(msg, flush=True)  # ids, step names, sizes and timings only
+    print(f"[reel {REEL}] {msg}", flush=True)
 
 
-def run(*cmd):
-    r = subprocess.run(list(cmd), capture_output=True, text=True)
-    if r.returncode != 0:
-        # ffmpeg's own error, last lines only, and never the caption text or links
-        raise RuntimeError(f"{cmd[0]} failed (exit {r.returncode}): {r.stderr.strip()[-400:]}")
+def call(method, url, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, method=method, headers={"Authorization": f"Bearer {TOKEN}", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return r.read()
 
 
-def fetch(src, dest, headers=None):
-    if not src.startswith(("http://", "https://")):
-        shutil.copyfile(src, dest)
-        return
-    req = urllib.request.Request(src, headers=headers or {})
-    size = 0
-    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
-        while block := r.read(1 << 20):
-            size += len(block)
-            if size > MAX_BYTES:
-                raise RuntimeError("an input is larger than 60 MB")
-            f.write(block)
+def download(url, path):
+    # Signed links need no token; send none so it is never forwarded.
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=120) as r, open(path, "wb") as f:
+        f.write(r.read())
+    return os.path.getsize(path)
 
 
-def zoompan(motion, frames, w, h):
-    """The zoompan expression for one shot, on an input already scaled to 2x the output size."""
-    zin = f"min(1+0.18*on/{frames},1.18)"
-    zout = f"max(1.18-0.18*on/{frames},1.0)"
-    if motion == "zoom_out":
-        return f"z='{zout}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-    if motion == "pan_right":
-        return f"z='1.12':x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)'"
-    if motion == "pan_left":
-        return f"z='1.12':x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)'"
-    return f"z='{zin}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+def ffmpeg(*args):
+    p = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        log("ffmpeg failed, last lines:")
+        print("\n".join(p.stderr.strip().splitlines()[-4:]), flush=True)
+        sys.exit(1)
 
 
-def render_shot(work, i, shot, w, h, fps):
-    seconds = max(1.0, min(float(shot.get("seconds", 4)), MAX_SECONDS))
-    frames = int(seconds * fps)
-    still = os.path.join(work, f"still{i}")
-    out = os.path.join(work, f"shot{i}.mp4")
-    motion = shot.get("motion") or MOTIONS[i % len(MOTIONS)]
-    vf = [f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2}", f"zoompan={zoompan(motion, frames, w, h)}:d={frames}:s={w}x{h}:fps={fps}"]
-    caption = (shot.get("caption") or "").strip()
-    if caption:
-        textfile = os.path.join(work, f"caption{i}.txt")
-        with open(textfile, "w", encoding="utf-8") as f:
-            f.write(caption)  # a text file, so the words never appear on a command line
-        vf.append(
-            f"drawtext=textfile={textfile}:fontcolor=white:fontsize={h // 28}:box=1:boxcolor=black@0.55:boxborderw={h // 90}"
-            f":x=(w-text_w)/2:y=h-text_h-{h // 10}:alpha='min(1,t/0.4)*min(1,({seconds}-t)/0.4)'"
-        )
-    vf.append("format=yuv420p")
-    run("ffmpeg", "-y", "-loglevel", "error", "-i", still, "-vf", ",".join(vf), "-frames:v", str(frames), "-r", str(fps), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", out)
-    return out, seconds
+def motion_filter(note, w, h, frames):
+    """A slow pan or zoom from the shot's motion note (words like in, out, left, right)."""
+    n = (note or "").lower()
+    big = f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2}"
+    step = 0.25 / frames
+    if "out" in n:
+        z, x, y = f"max(1.25-{step}*on,1)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    elif "left" in n:
+        z, x, y = "1.15", f"(iw-iw/zoom)*(1-on/{frames})", "ih/2-(ih/zoom/2)"
+    elif "right" in n:
+        z, x, y = "1.15", f"(iw-iw/zoom)*(on/{frames})", "ih/2-(ih/zoom/2)"
+    else:  # push in
+        z, x, y = f"min(1+{step}*on,1.25)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    return f"{big},zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={w}x{h}:fps={FPS}"
 
 
-def render(package, out_path, fetch_headers=None):
-    shots = package.get("shots") or []
-    if not 1 <= len(shots) <= MAX_SHOTS:
-        raise ValueError(f"a reel has 1 to {MAX_SHOTS} shots")
-    w, h = SIZES.get(package.get("aspect", "9:16"), SIZES["9:16"])
-    fps = int(package.get("fps", 30))
-    with tempfile.TemporaryDirectory() as work:
-        parts, total = [], 0.0
-        for i, shot in enumerate(shots):
-            t0 = time.time()
-            fetch(shot["still"], os.path.join(work, f"still{i}"), fetch_headers)
-            path, seconds = render_shot(work, i, shot, w, h, fps)
-            parts.append(path)
-            total += seconds
-            log(f"shot {i + 1}/{len(shots)} {seconds:.0f}s rendered in {time.time() - t0:.1f}s")
-        listing = os.path.join(work, "list.txt")
-        with open(listing, "w") as f:
-            f.writelines(f"file '{p}'\n" for p in parts)
-        joined = os.path.join(work, "joined.mp4")
-        run("ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined)
-        music = package.get("music")
-        if music:
-            track = os.path.join(work, "music")
-            fetch(music, track, fetch_headers)
-            run("ffmpeg", "-y", "-loglevel", "error", "-i", joined, "-i", track, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-af", f"afade=t=out:st={max(total - 1.5, 0)}:d=1.5", "-t", str(total), out_path)
-        else:
-            shutil.copyfile(joined, out_path)
-    size = os.path.getsize(out_path)
-    log(f"reel done: {total:.0f}s, {size / 2**20:.1f} MB")
-    return total, size
+def clip(tmp, i, shot, still, w, h):
+    secs = max(1, int(shot["seconds"]))
+    frames = secs * FPS
+    cap = os.path.join(tmp, f"cap{i}.txt")
+    width = 18 if h > w else 30
+    with open(cap, "w", encoding="utf-8") as f:
+        f.write("\n".join(textwrap.wrap(shot["caption"], width=width)))
+    size = max(40, w // 14)
+    text = (
+        f"drawtext=textfile={cap}:fontcolor=white:fontsize={size}:line_spacing=10:box=1:boxcolor=black@0.45:boxborderw=24:"
+        f"x=(w-text_w)/2:y=h-text_h-{h // 9}" + (f":fontfile={FONT}" if FONT else "")
+    )
+    out = os.path.join(tmp, f"clip{i}.mp4")
+    vf = f"{motion_filter(shot.get('motion'), w, h, frames)},{text},fade=t=in:d=0.3,fade=t=out:st={secs - 0.3}:d=0.3,format=yuv420p"
+    ffmpeg("-loop", "1", "-framerate", str(FPS), "-i", still, "-t", str(secs), "-vf", vf, "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-an", out)
+    return out
 
 
-def demo(out_dir):
-    """Synthetic stills so the whole path can be checked with no network and no secrets."""
-    os.makedirs(out_dir, exist_ok=True)
-    shots = []
-    for i, color in enumerate(["0x2b6cb0", "0x2f855a", "0xb7791f"]):
-        path = os.path.join(out_dir, f"demo-still{i}.png")
-        run("ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c={color}:s=1200x1600", "-frames:v", "1", path)
-        shots.append({"still": path, "seconds": 2, "caption": f"Demo shot {i + 1}"})
-    render({"aspect": "9:16", "fps": 30, "shots": shots}, os.path.join(out_dir, "demo.mp4"))
-
-
-def gateway(reel_id):
-    base = os.environ["GATEWAY_URL"].rstrip("/")
-    token = os.environ["RENDER_TOKEN"]
-    auth = {"Authorization": f"Bearer {token}", "User-Agent": "reels-render/1.0"}
-    req = urllib.request.Request(f"{base}/v1/render/{reel_id}/package", headers=auth)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        package = json.load(r)
-    out = os.path.join(tempfile.gettempdir(), "reel.mp4")
-    render(package, out)  # package links are signed: no credentials are sent to them
-    with open(out, "rb") as f:
-        data = f.read()
-    put = urllib.request.Request(f"{base}/v1/render/{reel_id}/reel.mp4", data=data, method="PUT", headers={**auth, "Content-Type": "video/mp4"})
-    urllib.request.urlopen(put, timeout=300).read()
-    log(f"uploaded {len(data) / 2**20:.1f} MB for reel {reel_id}")
+def main():
+    pkg = json.loads(call("GET", f"{GATEWAY}/v1/render/{REEL}/package"))
+    w, h = SIZES[pkg["aspect"]]
+    shots = [s for s in pkg["shots"] if s.get("still")]
+    if not shots:
+        log("no pictures in the package")
+        sys.exit(1)
+    log(f"package: {len(shots)} shots, {pkg['aspect']}")
+    with tempfile.TemporaryDirectory() as tmp:
+        clips = []
+        for i, s in enumerate(shots, 1):
+            path = os.path.join(tmp, f"still{i}.img")
+            log(f"shot {i}: picture {download(s['still'], path)} bytes")
+            clips.append(clip(tmp, i, s, path, w, h))
+        lst = os.path.join(tmp, "list.txt")
+        with open(lst, "w") as f:
+            f.write("".join(f"file '{c}'\n" for c in clips))
+        joined = os.path.join(tmp, "joined.mp4")
+        ffmpeg("-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", joined)
+        total = sum(int(s["seconds"]) for s in shots)
+        music = os.path.join(tmp, "music.audio")
+        has_music = False
+        if pkg.get("music"):
+            try:
+                log(f"music: {download(pkg['music'], music)} bytes")
+                has_music = True
+            except Exception:
+                log("music could not be fetched; continuing without it")
+        final = os.path.join(tmp, "reel.mp4")
+        audio = ["-i", music, "-af", f"volume=0.6,afade=t=out:st={max(0, total - 1.5)}:d=1.5"] if has_music else ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+        ffmpeg("-i", joined, *audio, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-t", str(total), "-movflags", "+faststart", final)
+        size = os.path.getsize(final)
+        log(f"rendered {size} bytes, {total} s; uploading")
+        with open(final, "rb") as f:
+            call("PUT", f"{GATEWAY}/v1/render/{REEL}/result", f.read(), {"Content-Type": "video/mp4"})
+    log("done")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--demo", action="store_true")
-    ap.add_argument("--reel")
-    ap.add_argument("--package")
-    ap.add_argument("--out", default="out")
-    a = ap.parse_args()
-    try:
-        if a.demo:
-            demo(a.out)
-        elif a.package:
-            os.makedirs(a.out, exist_ok=True)
-            render(json.load(open(a.package)), os.path.join(a.out, "reel.mp4"))
-        elif a.reel:
-            gateway(a.reel)
-        else:
-            ap.error("one of --demo, --package or --reel is required")
-    except Exception as e:  # noqa: BLE001
-        log(f"render failed: {type(e).__name__}: {str(e)[-300:]}")
-        sys.exit(1)
+    main()
