@@ -1,0 +1,21 @@
+# Proves the ffmpeg path on every push, with synthetic stills: no secrets, no network, nothing uploaded.
+name: Self-test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 render.py --demo --out out
+      - name: Check the result
+        run: |
+          ffprobe -v error -show_entries format=duration:stream=width,height -of default=nw=1 out/demo.mp4
+          test "$(ffprobe -v error -show_entries stream=width -of csv=p=0 out/demo.mp4)" = "1080"

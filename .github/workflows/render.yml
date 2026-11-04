@@ -1,0 +1,32 @@
+# Renders one reel for the zenkio AI gateway. Started by the gateway with workflow_dispatch.
+# PUBLIC repo: logs and dispatch inputs are public. The input is only the unguessable reel id; the stills,
+# captions and music are fetched at run time with a repo secret and never printed or uploaded as artifacts.
+name: Render reel
+
+on:
+  workflow_dispatch:
+    inputs:
+      reel_id:
+        description: Reel id (from the gateway)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render and upload
+        env:
+          GATEWAY_URL: ${{ vars.GATEWAY_URL }}
+          RENDER_TOKEN: ${{ secrets.RENDER_TOKEN }}
+          REEL_ID: ${{ inputs.reel_id }}
+        run: python3 render.py --reel "$REEL_ID"
